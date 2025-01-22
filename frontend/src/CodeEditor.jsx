@@ -1,64 +1,129 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import MonacoEditor from "@monaco-editor/react";
 import { io } from "socket.io-client";
-import { useParams } from "react-router-dom";
+import { useParams, useLocation } from "react-router-dom";
 import "./App.css";
 
 const socket = io("http://localhost:3000");
 
 function CodeEditor() {
   const { roomId } = useParams();
+  const location = useLocation();
+  const username = location.state?.username || "Anonymous";
+
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const decorationsRef = useRef([]);
+
   const [language, setLanguage] = useState("javascript");
   const [code, setCode] = useState("// Start typing your code here...");
   const [output, setOutput] = useState("");
+  const [cursors, setCursors] = useState({});
 
   useEffect(() => {
-    socket.emit('joinRoom', roomId);
+    socket.emit("joinRoom", { roomId, username });
 
-    socket.on('codeChange', (data) => {
-      setCode(data);
+    socket.on("initState", (state) => {
+      setCode(state.code);
+    });
+
+    socket.on("codeChange", (updatedCode) => {
+      setCode(updatedCode);
+    });
+
+    socket.on("cursorMove", ({ username: user, position, color }) => {
+      setCursors((prev) => ({
+        ...prev,
+        [user]: { position, color },
+      }));
+    });
+
+    socket.on("codeOutput", (result) => {
+      setOutput(result);
     });
 
     return () => {
-      socket.emit('leaveRoom', roomId);
-      socket.off('codeChange');
+      socket.emit("leaveRoom", { roomId, username });
+      socket.off("initState");
+      socket.off("codeChange");
+      socket.off("cursorMove");
+      socket.off("codeOutput");
     };
-  }, [roomId]);
+  }, [roomId, username]);
+
+  useEffect(() => {
+    // Make sure we have a monaco instance and an editor instance
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco) return;
+    // Decorate cursors
+    const newDecorations = Object.entries(cursors).map(([user, { position, color }]) => {
+      const { lineNumber, column } = position;
+      return {
+        range: new monaco.Range(lineNumber, column, lineNumber, column + 1),
+        options: {
+          className: `cursor-${user}`,
+          hoverMessage: { value: user },
+          beforeContentClassName: "cursor-decoration",
+          before: {
+            content: "|",
+            inlineClassName: `cursor-color-${user}`,
+            color,
+          },
+        },
+      };
+    });
+    decorationsRef.current = editor.deltaDecorations(decorationsRef.current, newDecorations);
+  }, [cursors]);
 
   const handleCodeChange = (value) => {
-    setCode(value || "");
-    socket.emit('codeChange', { roomId, code: value || "" });
+    setCode(value);
+    socket.emit("codeChange", { roomId, code: value });
+  };
+
+  const handleEditorDidMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+    editor.onDidChangeCursorPosition(() => {
+      const position = editor.getPosition();
+      socket.emit("cursorMove", {
+        roomId,
+        username,
+        position: {
+          lineNumber: position.lineNumber,
+          column: position.column,
+        },
+      });
+    });
   };
 
   const runCode = async () => {
     setOutput("Running code...");
-
     try {
       const response = await fetch("http://localhost:3000/api/execute", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, lang: language }),
       });
-
       const data = await response.json();
-      if (response.ok) {
-        setOutput(data.output.stdout || data.output.stderr || "No output");
-      } else {
-        setOutput(`Error: ${data.error}`);
-      }
+      const result = response.ok
+        ? data.output.stdout || data.output.stderr || "No output"
+        : `Error: ${data.error}`;
+      setOutput(result);
+      socket.emit("codeOutput", { roomId, output: result });
     } catch (error) {
-      setOutput(`Error: ${error.message}`);
+      const errorText = `Error: ${error.message}`;
+      setOutput(errorText);
+      socket.emit("codeOutput", { roomId, output: errorText });
     }
   };
 
   return (
     <div className="text-center">
-      <h1 className="text-5xl my-5">Code Editor</h1>
+      <h1 className="text-4xl my-5">Code Editor</h1>
       <div className="my-5">
         <label htmlFor="language" className="mr-3 font-bold text-lg">
-          Choose Language:
+          Language:
         </label>
         <select
           id="language"
@@ -79,6 +144,7 @@ function CodeEditor() {
           language={language}
           value={code}
           onChange={handleCodeChange}
+          onMount={handleEditorDidMount}
           theme="vs-dark"
           options={{
             fontSize: 14,
@@ -94,10 +160,9 @@ function CodeEditor() {
         Run Code
       </button>
       <div
-        className="bg-black text-white p-4 rounded"
+        className="bg-black text-white p-4 rounded mx-auto"
         style={{
           width: "80%",
-          margin: "0 auto",
           height: "200px",
           overflowY: "scroll",
           whiteSpace: "pre-wrap",
